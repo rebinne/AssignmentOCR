@@ -1,4 +1,9 @@
 <?php
+// --- BẮT ĐẦU ĐOẠN CODE GỠ LỖI ---
+ini_set('display_errors', 1);
+ini_set('display_startup_errors', 1);
+error_reporting(E_ALL);
+
 // ==========================================================
 // THAY ĐỔI 2 DÒNG DƯỚI ĐÂY BẰNG THÔNG TIN CỦA BẠN
 // ==========================================================
