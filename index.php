@@ -1,347 +1,146 @@
 <?php
 // =================================================================
-// CẤU HÌNH AZURE
+// 1. CẤU HÌNH (Thay đổi Key và Endpoint của bạn tại đây)
 // =================================================================
 $subscriptionKey = 'C2AYxOz9S5FROr1owuO0LKfd197UcleqB3CVjrUNYWnIfgGwgMulJQQJ99CAACi0881XJ3w3AAAFACOGaliF'; 
 $endpoint = 'https://24jn0446ocr.cognitiveservices.azure.com/'; 
 $uriBase = $endpoint . "vision/v3.2/read/analyze";
 
-// =================================================================
-// CẤU HÌNH DATABASE (Azure MySQL - Free Tier)
-// Thay đổi thông tin này theo database Azure của bạn
-// =================================================================
+// Cấu hình Database Azure
 $dbHost = 'your-server-name.mysql.database.azure.com';
 $dbName = 'receipts_db';
 $dbUser = 'your-admin-username';
 $dbPass = 'your-password';
-$dbPort = 3306;
 
-// File log và CSV
-$logFile = '/tmp/ocr.log';
-$csvFile = '/tmp/result.csv';
-
-// =================================================================
-// KẾT NỐI DATABASE
-// =================================================================
-function getDBConnection() {
-    global $dbHost, $dbName, $dbUser, $dbPass, $dbPort;
-    try {
-        $dsn = "mysql:host=$dbHost;port=$dbPort;dbname=$dbName;charset=utf8mb4";
-        $pdo = new PDO($dsn, $dbUser, $dbPass, [
-            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-            PDO::MYSQL_ATTR_SSL_CA => true
-        ]);
-        return $pdo;
-    } catch (PDOException $e) {
-        writeLog("DATABASE ERROR: " . $e->getMessage());
-        return null;
-    }
-}
-
-// Tạo bảng nếu chưa có
-function initDatabase() {
-    $pdo = getDBConnection();
-    if (!$pdo) return false;
-    
-    $sql = "CREATE TABLE IF NOT EXISTS receipts (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        file_name VARCHAR(255) NOT NULL,
-        upload_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-        total_amount DECIMAL(10,2),
-        INDEX idx_upload_date (upload_date),
-        INDEX idx_file_name (file_name)
-    )";
-    
-    $sql2 = "CREATE TABLE IF NOT EXISTS receipt_items (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        receipt_id INT NOT NULL,
-        item_name VARCHAR(255) NOT NULL,
-        price DECIMAL(10,2) NOT NULL,
-        is_total BOOLEAN DEFAULT FALSE,
-        FOREIGN KEY (receipt_id) REFERENCES receipts(id) ON DELETE CASCADE,
-        INDEX idx_receipt_id (receipt_id)
-    )";
-    
-    try {
-        $pdo->exec($sql);
-        $pdo->exec($sql2);
-        return true;
-    } catch (PDOException $e) {
-        writeLog("CREATE TABLE ERROR: " . $e->getMessage());
-        return false;
-    }
-}
+// File lưu trữ (Dùng đường dẫn hiện tại để Azure dễ truy cập)
+$logFile = __DIR__ . '/ocr.log';
+$csvFile = __DIR__ . '/result.csv';
 
 // =================================================================
-// HÀM GHI LOG
+// 2. CÁC HÀM HỖ TRỢ
 // =================================================================
+
 function writeLog($content) {
     global $logFile;
     $timestamp = date('Y-m-d H:i:s');
     file_put_contents($logFile, "[$timestamp] $content\n", FILE_APPEND);
 }
 
-// =================================================================
-// HÀM LÀM SẠCH TÊN MÓN
-// =================================================================
+// Hàm làm sạch tên theo đúng yêu cầu: KHÔNG "軽", KHÔNG "◎", KHÔNG dư thừa
 function cleanName($str) {
-    // Xóa các ký tự gây nhiễu
-    $removeList = [
-        '◎', '軽', '軽減税率対象商品', 
-        '¥', '￥', '*', '※', 
-        '内消費税等', '(10%)', '(8%)',
-        '外消費税等'
-    ];
+    $removeList = ['◎', '軽', '軽減税率対象商品', '¥', '￥', '*', '※', '対象'];
     $str = str_replace($removeList, '', $str);
-    $str = preg_replace('/\s+/u', ' ', $str); // Loại bỏ space thừa
+    // Xóa các dòng liên quan đến thuế
+    if (preg_match('/(内消費税|外消費税|税率)/u', $str)) return "";
+    // Xóa các ký tự đặc biệt còn sót lại, chỉ giữ chữ và số
+    $str = preg_replace('/[^\x{3040}-\x{309F}\x{30A0}-\x{30FF}\x{4E00}-\x{9FAF}a-zA-Z0-9\s]/u', '', $str);
     return trim($str);
 }
 
-// =================================================================
-// HÀM LƯU VÀO DATABASE
-// =================================================================
-function saveToDatabase($fileName, $items) {
-    $pdo = getDBConnection();
-    if (!$pdo) return false;
-    
+function getDBConnection() {
+    global $dbHost, $dbName, $dbUser, $dbPass;
     try {
-        $pdo->beginTransaction();
-        
-        // Tính tổng tiền
-        $totalAmount = 0;
-        foreach ($items as $item) {
-            if ($item['isTotal']) {
-                $totalAmount = $item['price'];
-                break;
-            }
-        }
-        
-        // Lưu receipt
-        $stmt = $pdo->prepare("INSERT INTO receipts (file_name, total_amount) VALUES (?, ?)");
-        $stmt->execute([$fileName, $totalAmount]);
-        $receiptId = $pdo->lastInsertId();
-        
-        // Lưu items
-        $stmt = $pdo->prepare("INSERT INTO receipt_items (receipt_id, item_name, price, is_total) VALUES (?, ?, ?, ?)");
-        foreach ($items as $item) {
-            $stmt->execute([
-                $receiptId,
-                $item['name'],
-                $item['price'],
-                $item['isTotal'] ? 1 : 0
-            ]);
-        }
-        
-        $pdo->commit();
-        writeLog("Saved to database: $fileName (Receipt ID: $receiptId)");
-        return true;
-    } catch (PDOException $e) {
-        $pdo->rollBack();
-        writeLog("Database save error: " . $e->getMessage());
-        return false;
+        $dsn = "mysql:host=$dbHost;dbname=$dbName;charset=utf8mb4";
+        return new PDO($dsn, $dbUser, $dbPass, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+    } catch (Exception $e) {
+        writeLog("DB Connection Error: " . $e->getMessage());
+        return null;
     }
 }
 
 // =================================================================
-// MAIN PROCESSING
+// 3. XỬ LÝ CHÍNH
 // =================================================================
-$results = []; 
-$debugText = [];
-
-// Khởi tạo database
-initDatabase();
-
-// Khởi tạo log file
-if (!file_exists($logFile)) {
-    file_put_contents($logFile, "=== FamilyMart OCR Log ===\n");
-}
+$results = [];
 
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['images'])) {
+    writeLog("--- BẮT ĐẦU PHIÊN XỬ LÝ MỚI ---");
     
-    writeLog("========== NEW UPLOAD SESSION ==========");
-    
-    // Tạo file CSV với BOM cho Excel Japanese
-    if (file_exists($csvFile)) {
-        unlink($csvFile);
-    }
-    file_put_contents($csvFile, "\xEF\xBB\xBF");
-    $handle = fopen($csvFile, 'a');
-    fputcsv($handle, ['ファイル名', '商品名', '値段', '合計フラグ']);
-    fclose($handle);
+    // Khởi tạo file CSV (BOM giúp Excel đọc tiếng Nhật không lỗi)
+    file_put_contents($csvFile, "\xEF\xBB\xBF" . "ファイル名,商品名,値段,備考\n");
 
-    $totalFiles = count($_FILES['images']['name']);
-    writeLog("Total files to process: $totalFiles");
+    foreach ($_FILES['images']['tmp_name'] as $key => $tmpFilePath) {
+        $fileName = $_FILES['images']['name'][$key];
+        if (!$tmpFilePath) continue;
 
-    for ($i = 0; $i < $totalFiles; $i++) {
-        $tmpFilePath = $_FILES['images']['tmp_name'][$i];
-        $fileName = $_FILES['images']['name'][$i];
+        // Bước A: Gửi ảnh lên Azure AI Vision
+        $data = file_get_contents($tmpFilePath);
+        $headers = ['Content-Type: application/octet-stream', 'Ocp-Apim-Subscription-Key: ' . $subscriptionKey];
 
-        if ($tmpFilePath != "") {
-            writeLog("Processing file: $fileName");
-            
-            // Gửi ảnh lên Azure OCR
-            $data = file_get_contents($tmpFilePath);
-            $headers = [
-                'Content-Type: application/octet-stream',
-                'Ocp-Apim-Subscription-Key: ' . $subscriptionKey
-            ];
+        $ch = curl_init($uriBase);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $data);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_HEADER, true);
+        $response = curl_exec($ch);
+        
+        preg_match('/Operation-Location: (.*)/i', $response, $matches);
+        if (!isset($matches[1])) continue;
 
-            $ch = curl_init();
-            curl_setopt($ch, CURLOPT_URL, $uriBase);
-            curl_setopt($ch, CURLOPT_POST, true);
-            curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
-            curl_setopt($ch, CURLOPT_POSTFIELDS, $data);
-            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-            curl_setopt($ch, CURLOPT_HEADER, true); 
-            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        $operationLocation = trim($matches[1]);
+        $analysis = null;
 
-            $response = curl_exec($ch);
-            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
-            $responseHeader = substr($response, 0, $headerSize);
-            curl_close($ch);
+        // Bước B: Đợi kết quả OCR (polling)
+        for ($i = 0; $i < 10; $i++) {
+            sleep(1);
+            $ch2 = curl_init($operationLocation);
+            curl_setopt($ch2, CURLOPT_HTTPHEADER, ['Ocp-Apim-Subscription-Key: ' . $subscriptionKey]);
+            curl_setopt($ch2, CURLOPT_RETURNTRANSFER, true);
+            $analysis = json_decode(curl_exec($ch2), true);
+            curl_close($ch2);
+            if (isset($analysis['status']) && $analysis['status'] == 'succeeded') break;
+        }
 
-            writeLog("Azure OCR Response Code: $httpCode");
+        // Bước C: Trích xuất và lọc dữ liệu "Sạch"
+        if ($analysis && $analysis['status'] == 'succeeded') {
+            $extractedItems = [];
+            $lines = $analysis['analyzeResult']['readResults'][0]['lines'];
 
-            preg_match('/Operation-Location: (.*)/i', $responseHeader, $matches);
-            
-            if (isset($matches[1])) {
-                $operationLocation = trim($matches[1]);
-                $analysis = null;
+            writeLog("RAW OCR [$fileName]: " . implode(" | ", array_column($lines, 'text')));
 
-                // Loop đợi kết quả
-                for ($retry = 0; $retry < 15; $retry++) {
-                    sleep(2);
-                    $ch2 = curl_init();
-                    curl_setopt($ch2, CURLOPT_URL, $operationLocation);
-                    curl_setopt($ch2, CURLOPT_HTTPHEADER, ['Ocp-Apim-Subscription-Key: ' . $subscriptionKey]);
-                    curl_setopt($ch2, CURLOPT_RETURNTRANSFER, true);
-                    curl_setopt($ch2, CURLOPT_SSL_VERIFYPEER, false);
-                    $resultJson = curl_exec($ch2);
-                    curl_close($ch2);
+            foreach ($lines as $line) {
+                $text = $line['text'];
 
-                    $analysis = json_decode($resultJson, true);
-                    if (isset($analysis['status']) && $analysis['status'] == 'succeeded') {
-                        writeLog("OCR succeeded for: $fileName");
-                        break;
+                // 1. Loại bỏ các dòng rác (Địa chỉ, SĐT, Website, Ngày tháng)
+                if (preg_match('/(TEL|電話|http|202|レジ|担当|店)/i', $text)) continue;
+
+                // 2. Tìm cấu trúc: [Tên sản phẩm] [Số tiền]
+                // Regex tìm số tiền ở cuối dòng, bỏ qua "軽"
+                if (preg_match('/^(.+?)[\s¥￥]*([0-9,]+)(?:軽)?$/u', $text, $matches)) {
+                    $name = cleanName($matches[1]);
+                    $price = str_replace(',', '', $matches[2]);
+
+                    if (empty($name) || !is_numeric($price)) continue;
+
+                    // Nhận diện dòng TỔNG TIỀN
+                    $isTotal = false;
+                    if (preg_match('/(合計|小計)/u', $name)) {
+                        $name = "合計"; 
+                        $isTotal = true;
                     }
+
+                    // Chỉ lưu nếu là tên sản phẩm hợp lệ hoặc dòng Tổng
+                    $extractedItems[] = ['name' => $name, 'price' => $price, 'isTotal' => $isTotal];
+                    
+                    // Ghi CSV
+                    $csvLine = "$fileName,$name,$price," . ($isTotal ? "TOTAL" : "") . "\n";
+                    file_put_contents($csvFile, $csvLine, FILE_APPEND);
+                    writeLog("Extracted: $name -> $price");
                 }
-
-                if ($analysis && $analysis['status'] == 'succeeded') {
-                    $lines = $analysis['analyzeResult']['readResults'][0]['lines'];
-                    $extractedItems = [];
-                    $rawLines = [];
-                    $csvHandle = fopen($csvFile, 'a');
-
-                    writeLog("--- RAW OCR OUTPUT for $fileName ---");
-
-                    foreach ($lines as $line) {
-                        $text = $line['text'];
-                        $rawLines[] = $text;
-                        writeLog($text);
-
-                        // BLACKLIST - Bỏ qua các dòng rác
-                        $blacklist = [
-                            '電話', 'TEL', '年月日', '登録番号', 'レジ', '東京都', 
-                            'http', 'www', '店舗', '営業時間', '領収書', 'お買上',
-                            '株式会社', 'ファミリーマート', 'FamilyMart', 'Tマネ',
-                            '現金', 'お預り', 'おつり', 'ポイント'
-                        ];
-                        
-                        $skip = false;
-                        foreach ($blacklist as $word) {
-                            if (strpos($text, $word) !== false) {
-                                $skip = true;
-                                break;
-                            }
-                        }
-                        if ($skip) continue;
-
-                        // パターンマッチング: 末尾に数字がある行を探す
-                        // ¥マークがあってもなくても対応
-                        if (preg_match('/^(.+?)[\s¥￥]*([0-9,]+)(?:軽)?$/u', $text, $matches)) {
-                            
-                            $nameRaw = $matches[1];
-                            $priceRaw = $matches[2];
-                            
-                            $nameClean = cleanName($nameRaw);
-                            $priceClean = str_replace(',', '', $priceRaw);
-
-                            // バリデーション
-                            if (!is_numeric($priceClean)) continue;
-                            if (mb_strlen($nameClean) < 2) continue;
-                            
-                            // 住所パターンをブロック (1-1-17など)
-                            if (preg_match('/\d+-\d+-\d+/', $text)) continue;
-                            
-                            // 日付パターンをブロック (2024/12/31など)
-                            if (preg_match('/\d{4}\/\d{1,2}\/\d{1,2}/', $text)) continue;
-                            if (preg_match('/\d{2}\/\d{2}\/\d{2}/', $text)) continue;
-                            
-                            // 年号をブロック
-                            if ($priceClean >= 2000 && $priceClean <= 2030) continue;
-                            
-                            // 電話番号をブロック (0から始まる7桁以上)
-                            if (strlen($priceClean) > 7 && substr($priceClean, 0, 1) == '0') continue;
-                            
-                            // 時刻をブロック (例: 12:34)
-                            if (preg_match('/\d{1,2}:\d{2}/', $text)) continue;
-
-                            // 合計チェック
-                            $isTotal = false;
-                            if (preg_match('/合\s*計|合計|小計/', $nameClean)) {
-                                $isTotal = true;
-                            }
-
-                            // 結果を保存
-                            $itemData = [
-                                'name' => $nameClean,
-                                'price' => $priceClean,
-                                'isTotal' => $isTotal
-                            ];
-                            $extractedItems[] = $itemData;
-                            fputcsv($csvHandle, [
-                                $fileName, 
-                                $nameClean, 
-                                $priceClean, 
-                                $isTotal ? 'YES' : 'NO'
-                            ]);
-                            
-                            writeLog("Extracted: $nameClean = ¥$priceClean" . ($isTotal ? " [TOTAL]" : ""));
-                        }
-                    }
-                    
-                    fclose($csvHandle);
-                    $results[$fileName] = $extractedItems;
-                    $debugText[$fileName] = $rawLines;
-                    
-                    // データベースに保存
-                    if (!empty($extractedItems)) {
-                        saveToDatabase($fileName, $extractedItems);
-                    }
-                    
-                    writeLog("--- END OF FILE: $fileName ---");
-                } else {
-                    writeLog("OCR failed for: $fileName");
-                }
-            } else {
-                writeLog("No Operation-Location header found for: $fileName");
             }
+            $results[$fileName] = $extractedItems;
         }
     }
-    
-    writeLog("========== END OF SESSION ==========\n");
 }
 
-// Download
+// Xử lý tải file
 if (isset($_GET['download'])) {
-    $fileToDownload = ($_GET['download'] == 'csv') ? $csvFile : $logFile;
-    if (file_exists($fileToDownload)) {
+    $file = ($_GET['download'] == 'csv') ? $csvFile : $logFile;
+    if (file_exists($file)) {
         header('Content-Type: application/octet-stream');
-        header('Content-Disposition: attachment; filename="'.basename($fileToDownload).'"');
-        readfile($fileToDownload);
-        exit;
+        header('Content-Disposition: attachment; filename="'.basename($file).'"');
+        readfile($file); exit;
     }
 }
 ?>
@@ -350,220 +149,53 @@ if (isset($_GET['download'])) {
 <html lang="ja">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ファミリーマート レシートOCR</title>
+    <title>FamilyMart Receipt OCR</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { 
-            font-family: 'Hiragino Kaku Gothic ProN', 'メイリオ', sans-serif; 
-            background: linear-gradient(135deg, #009944 0%, #00cc66 100%);
-            padding: 20px;
-            min-height: 100vh;
-        }
-        .container { 
-            max-width: 900px; 
-            margin: 0 auto; 
-            background: white; 
-            padding: 30px; 
-            border-radius: 12px;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
-        }
-        h1 {
-            text-align: center;
-            color: #009944;
-            margin-bottom: 10px;
-            font-size: 28px;
-        }
-        .subtitle {
-            text-align: center;
-            color: #666;
-            margin-bottom: 30px;
-            font-size: 14px;
-        }
-        .upload-form {
-            text-align: center;
-            padding: 40px 20px;
-            border: 3px dashed #009944;
-            border-radius: 8px;
-            background: #f8fff9;
-            margin-bottom: 30px;
-        }
-        .upload-form input[type="file"] {
-            margin-bottom: 20px;
-        }
-        .btn {
-            padding: 12px 30px;
-            background: #009944;
-            color: white;
-            border-radius: 6px;
-            text-decoration: none;
-            cursor: pointer;
-            border: none;
-            font-size: 16px;
-            font-weight: bold;
-            transition: background 0.3s;
-            display: inline-block;
-        }
-        .btn:hover {
-            background: #007733;
-        }
-        .btn-secondary {
-            background: #4CAF50;
-        }
-        .btn-secondary:hover {
-            background: #45a049;
-        }
-        .btn-dark {
-            background: #333;
-        }
-        .btn-dark:hover {
-            background: #555;
-        }
-        .receipt-card {
-            margin-top: 25px;
-            border: 2px solid #009944;
-            padding: 20px;
-            border-radius: 8px;
-            background: #fafafa;
-        }
-        .receipt-card h3 {
-            color: #009944;
-            margin-bottom: 15px;
-            display: flex;
-            align-items: center;
-        }
-        .receipt-card h3::before {
-            content: "📄";
-            margin-right: 10px;
-        }
-        .item-header {
-            font-weight: bold;
-            display: flex;
-            justify-content: space-between;
-            border-bottom: 2px solid #009944;
-            padding-bottom: 8px;
-            margin-bottom: 10px;
-        }
-        .item-row {
-            display: flex;
-            justify-content: space-between;
-            padding: 10px 5px;
-            border-bottom: 1px solid #eee;
-        }
-        .item-row:hover {
-            background: #f0f0f0;
-        }
-        .total-row {
-            color: #d32f2f;
-            font-weight: bold;
-            font-size: 1.3em;
-            border-top: 3px solid #009944;
-            background: #fff3f3;
-            padding: 15px 5px !important;
-            margin-top: 10px;
-        }
-        .download-section {
-            text-align: center;
-            margin-top: 30px;
-            padding-top: 20px;
-            border-top: 2px solid #eee;
-        }
-        .download-section a {
-            margin: 0 10px;
-        }
-        .debug-box {
-            background: #1e1e1e;
-            color: #00ff00;
-            padding: 15px;
-            display: none;
-            margin-top: 20px;
-            white-space: pre-wrap;
-            font-size: 12px;
-            font-family: 'Courier New', monospace;
-            border-radius: 8px;
-            max-height: 500px;
-            overflow-y: auto;
-        }
-        .no-data {
-            color: #d32f2f;
-            text-align: center;
-            padding: 20px;
-            font-weight: bold;
-        }
-        .success-message {
-            background: #d4edda;
-            color: #155724;
-            padding: 15px;
-            border-radius: 6px;
-            margin-bottom: 20px;
-            border: 1px solid #c3e6cb;
-        }
+        body { font-family: sans-serif; background: #f4f7f6; padding: 20px; color: #333; }
+        .container { max-width: 800px; margin: auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .upload-area { border: 2px dashed #009944; padding: 20px; text-align: center; margin-bottom: 20px; background: #f9fffb; }
+        .receipt-table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+        .receipt-table th, .receipt-table td { border: 1px solid #ddd; padding: 10px; text-align: left; }
+        .receipt-table th { background: #009944; color: white; }
+        .total-row { background: #fff3f3; font-weight: bold; color: #d32f2f; }
+        .btn { display: inline-block; padding: 10px 20px; background: #009944; color: white; text-decoration: none; border-radius: 5px; margin: 5px; border: none; cursor: pointer; }
+        .btn-log { background: #333; }
     </style>
-    <script>
-        function toggleDebug() {
-            var x = document.getElementById("debugInfo");
-            x.style.display = (x.style.display === "none") ? "block" : "none";
-        }
-    </script>
 </head>
 <body>
+
 <div class="container">
-    <h1>🏪 ファミリーマート レシートOCR</h1>
-    <p class="subtitle">Azure AI Vision を使用したレシート読み取りシステム</p>
+    <h2>🏪 FamilyMart Receipt OCR</h2>
     
-    <form method="POST" enctype="multipart/form-data" class="upload-form">
-        <div style="margin-bottom: 15px;">
-            <label style="font-weight: bold; color: #009944;">📷 レシート画像を選択してください（複数可）</label>
-        </div>
-        <input type="file" name="images[]" multiple required accept="image/*">
-        <br>
-        <button type="submit" class="btn">🔍 読み取り開始</button>
-    </form>
+    <div class="upload-area">
+        <form method="POST" enctype="multipart/form-data">
+            <input type="file" name="images[]" multiple accept="image/*" required>
+            <button type="submit" class="btn">Dịch hóa đơn</button>
+        </form>
+    </div>
 
     <?php if (!empty($results)): ?>
-        <div class="success-message">
-            ✅ <?php echo count($results); ?>件のレシートを処理しました！
-        </div>
-
-        <?php foreach ($results as $filename => $items): ?>
-            <div class="receipt-card">
-                <h3><?php echo htmlspecialchars($filename); ?></h3>
-                <?php if (empty($items)): ?>
-                    <p class="no-data">❌ データが抽出できませんでした。デバッグ情報を確認してください。</p>
-                <?php else: ?>
-                    <div class="item-header">
-                        <span>商品名</span>
-                        <span>値段</span>
-                    </div>
+        <?php foreach ($results as $fname => $items): ?>
+            <div style="margin-bottom: 30px; border-bottom: 2px solid #eee; padding-bottom: 10px;">
+                <h4 style="color: #009944;">📄 File: <?php echo htmlspecialchars($fname); ?></h4>
+                <table class="receipt-table">
+                    <tr><th>Tên sản phẩm</th><th>Giá tiền</th></tr>
                     <?php foreach ($items as $item): ?>
-                        <div class="item-row <?php echo $item['isTotal'] ? 'total-row' : ''; ?>">
-                            <span><?php echo htmlspecialchars($item['name']); ?></span>
-                            <span>¥<?php echo number_format($item['price']); ?></span>
-                        </div>
+                        <tr class="<?php echo $item['isTotal'] ? 'total-row' : ''; ?>">
+                            <td><?php echo htmlspecialchars($item['name']); ?></td>
+                            <td>¥<?php echo number_format($item['price']); ?></td>
+                        </tr>
                     <?php endforeach; ?>
-                <?php endif; ?>
+                </table>
             </div>
         <?php endforeach; ?>
 
-        <div class="download-section">
-            <h3 style="margin-bottom: 15px;">📥 ダウンロード</h3>
-            <a href="?download=csv" class="btn btn-secondary">CSV ダウンロード</a>
-            <a href="?download=log" class="btn btn-secondary">ocr.log ダウンロード</a>
-            <br><br>
-            <button onclick="toggleDebug()" class="btn btn-dark">🐛 デバッグ情報を表示</button>
-        </div>
-
-        <div id="debugInfo" class="debug-box">
-            <strong>=== OCR 生データ ===</strong><br><br>
-            <?php foreach ($debugText as $file => $lines): ?>
-                <strong style="color: #ffff00;">📄 <?php echo htmlspecialchars($file); ?></strong><br>
-                <?php foreach ($lines as $line): ?>
-                    <?php echo htmlspecialchars($line); ?><br>
-                <?php endforeach; ?>
-                <br>-----------------------------------<br><br>
-            <?php endforeach; ?>
+        <div style="text-align: center;">
+            <a href="?download=csv" class="btn">Tải file CSV</a>
+            <a href="?download=log" class="btn btn-log">Tải file ocr.log</a>
         </div>
     <?php endif; ?>
 </div>
+
 </body>
 </html>
