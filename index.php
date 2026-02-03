@@ -6,12 +6,6 @@ $subscriptionKey = 'C2AYxOz9S5FROr1owuO0LKfd197UcleqB3CVjrUNYWnIfgGwgMulJQQJ99CA
 $endpoint = 'https://24jn0446ocr.cognitiveservices.azure.com/'; 
 $uriBase = $endpoint . "vision/v3.2/read/analyze";
 
-// Cấu hình Database Azure
-$dbHost = 'your-server-name.mysql.database.azure.com';
-$dbName = 'receipts_db';
-$dbUser = 'your-admin-username';
-$dbPass = 'your-password';
-
 // File lưu trữ
 $logFile = __DIR__ . '/ocr.log';
 $csvFile = __DIR__ . '/result.csv';
@@ -26,58 +20,63 @@ function writeLog($content) {
     file_put_contents($logFile, "[$timestamp] $content\n", FILE_APPEND);
 }
 
-// Hàm làm sạch tên sản phẩm - CHỈ loại bỏ "軽" và ký tự đặc biệt không cần thiết
+// Hàm làm sạch tên sản phẩm
 function cleanProductName($str) {
     // Loại bỏ "軽" ở cuối
-    $str = preg_replace('/軽$/', '', $str);
+    $str = preg_replace('/軽$/u', '', $str);
+    // Loại bỏ dấu ◎ ở đầu (nếu có)
+    $str = preg_replace('/^◎/u', '', $str);
     // Loại bỏ khoảng trắng thừa
     $str = trim($str);
     return $str;
 }
 
-// Kiểm tra xem có phải là dòng sản phẩm không
-function isValidProductLine($text) {
-    // Bỏ qua các dòng không phải sản phẩm
+// Kiểm tra xem có phải là dòng không cần thiết không
+function shouldSkipLine($text) {
+    // Danh sách các pattern cần bỏ qua
     $skipPatterns = [
+        '/^FamilyMart/i',
         '/^TEL/i',
         '/^電話/i',
+        '/^登録番号/i',
         '/http/i',
         '/レジ/i',
         '/担当/i',
         '/店舗/i',
-        '/時刻/i',
-        '/^\d{4}\/\d{2}\/\d{2}/', // Ngày tháng
+        '/^\d{4}年\d{1,2}月\d{1,2}日/u', // Ngày tháng
         '/^\d{2}:\d{2}/', // Giờ
-        '/領収/', // Hóa đơn
-        '/ポイント/', // Điểm
-        '/お預/', // Tiền đưa
-        '/お釣/', // Tiền thối
-        '/現金/', // Tiền mặt
-        '/クレジット/', // Credit
-        '/カード/', // Card
-        '/^¥?\s*\d+\s*$/', // Chỉ có số tiền đơn thuần
-        '/ありがとう/', // Cảm ơn
-        '/またお越し/' // Hẹn gặp lại
+        '/領収/u',
+        '/ポイント/u',
+        '/お預/u',
+        '/お釣/u',
+        '/現金/u',
+        '/クレジット/u',
+        '/カード/u',
+        '/ありがとう/u',
+        '/またお越し/u',
+        '/交通系マネー残高/u',
+        '/交通系マネー支払/u',
+        '/対象商品/u',
+        '/消費税/u',
+        '/軽減税率/u',
+        '/ファミ/u',
+        '/クーポン/u',
+        '/QRコード/u',
+        '/アプリ/u',
+        '/東京都/u',
+        '/新宿区/u',
+        '/貴No/u',
+        '/^¥\s*\d+\s*\)/u', // Dòng chỉ có thuế
+        '/^\(\s*内\s*\)/u', // Dòng thuế trong ngoặc
     ];
     
     foreach ($skipPatterns as $pattern) {
         if (preg_match($pattern, $text)) {
-            return false;
+            return true;
         }
     }
     
-    return true;
-}
-
-function getDBConnection() {
-    global $dbHost, $dbName, $dbUser, $dbPass;
-    try {
-        $dsn = "mysql:host=$dbHost;dbname=$dbName;charset=utf8mb4";
-        return new PDO($dsn, $dbUser, $dbPass, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
-    } catch (Exception $e) {
-        writeLog("DB Connection Error: " . $e->getMessage());
-        return null;
-    }
+    return false;
 }
 
 // =================================================================
@@ -147,7 +146,10 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['images'])) {
 
             // Ghi log tất cả text đã OCR được
             $allText = array_column($lines, 'text');
-            writeLog("Toàn bộ text OCR được từ $fileName: " . implode(" | ", $allText));
+            writeLog("Toàn bộ text OCR được từ $fileName:");
+            foreach ($allText as $idx => $txt) {
+                writeLog("  [$idx] $txt");
+            }
 
             foreach ($lines as $line) {
                 $text = trim($line['text']);
@@ -155,45 +157,42 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['images'])) {
                 // Bỏ qua dòng trống
                 if (empty($text)) continue;
                 
-                // Bỏ qua các dòng không phải sản phẩm
-                if (!isValidProductLine($text)) {
-                    writeLog("Bỏ qua dòng: $text");
+                // Bỏ qua các dòng không cần thiết
+                if (shouldSkipLine($text)) {
+                    writeLog("❌ Bỏ qua: $text");
                     continue;
                 }
 
-                // Tìm pattern: [Tên sản phẩm] [Giá tiền]
-                // Pattern 1: Tên + giá (có thể có ¥ hoặc không, có thể có 軽)
-                if (preg_match('/^(.+?)\s*¥?([0-9,]+)軽?$/u', $text, $matches)) {
-                    $productName = cleanProductName(trim($matches[1]));
-                    $price = str_replace(',', '', $matches[2]);
-                    
-                    // Kiểm tra xem có phải dòng tổng tiền không
-                    if (preg_match('/(合計|小計|計)/u', $productName)) {
-                        $productName = "合計";
-                        $extractedItems[] = [
-                            'name' => $productName, 
-                            'price' => $price, 
-                            'isTotal' => true
-                        ];
-                    } else if (!empty($productName) && is_numeric($price)) {
-                        $extractedItems[] = [
-                            'name' => $productName, 
-                            'price' => $price, 
-                            'isTotal' => false
-                        ];
-                    }
-                    
-                    writeLog("Trích xuất được: $productName -> ¥$price");
-                }
-                // Pattern 2: Chỉ số tiền cho dòng tổng
-                else if (preg_match('/^(合計|小計|計)\s*¥?([0-9,]+)$/u', $text, $matches)) {
+                // Pattern 1: Dòng "合計" với giá tiền
+                if (preg_match('/^(合計|小計|計)\s*¥?([0-9,]+)$/u', $text, $matches)) {
                     $price = str_replace(',', '', $matches[2]);
                     $extractedItems[] = [
                         'name' => "合計", 
                         'price' => $price, 
                         'isTotal' => true
                     ];
-                    writeLog("Trích xuất tổng tiền: 合計 -> ¥$price");
+                    writeLog("✅ Tổng tiền: 合計 -> ¥$price");
+                    continue;
+                }
+
+                // Pattern 2: Tên sản phẩm + giá tiền (có thể có ¥ hoặc 軽)
+                // Ví dụ: "アポロチョコレート ¥198軽", "◎チョコバターメロンパ ¥168軽"
+                if (preg_match('/^(◎?[^\¥]+?)\s*¥?([0-9,]+)軽?$/u', $text, $matches)) {
+                    $productName = cleanProductName(trim($matches[1]));
+                    $price = str_replace(',', '', $matches[2]);
+                    
+                    // Kiểm tra không phải là dòng tổng tiền
+                    if (!preg_match('/(合計|小計|計)/u', $productName)) {
+                        // Kiểm tra tên sản phẩm hợp lệ (không chỉ là số)
+                        if (!preg_match('/^\d+$/u', $productName) && !empty($productName)) {
+                            $extractedItems[] = [
+                                'name' => $productName, 
+                                'price' => $price, 
+                                'isTotal' => false
+                            ];
+                            writeLog("✅ Sản phẩm: $productName -> ¥$price");
+                        }
+                    }
                 }
             }
 
@@ -204,13 +203,13 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['images'])) {
             }
 
             $results[$fileName] = $extractedItems;
-            writeLog("Hoàn thành xử lý file $fileName với " . count($extractedItems) . " mục");
+            writeLog("✅ Hoàn thành file $fileName: " . count($extractedItems) . " mục");
         } else {
-            writeLog("Lỗi OCR cho file $fileName: " . ($analysis['status'] ?? 'unknown error'));
+            writeLog("❌ Lỗi OCR cho file $fileName");
         }
     }
 
-    writeLog("--- HOÀN THÀNH PHIÊN XỬ LÝ ---");
+    writeLog("--- HOÀN THÀNH ---");
 }
 
 // Xử lý tải file
@@ -230,7 +229,7 @@ if (isset($_GET['download'])) {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FamilyMart Receipt OCR</title>
+    <title>FamilyMart Receipt OCR - Improved</title>
     <style>
         * {
             margin: 0;
@@ -239,11 +238,10 @@ if (isset($_GET['download'])) {
         }
         
         body { 
-            font-family: 'Arial', sans-serif; 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             min-height: 100vh;
             padding: 20px; 
-            color: #333; 
         }
         
         .container { 
@@ -278,7 +276,7 @@ if (isset($_GET['download'])) {
         }
         
         .receipt-container {
-            margin-bottom: 40px;
+            margin-bottom: 30px;
             border: 2px solid #e0e0e0;
             border-radius: 10px;
             overflow: hidden;
@@ -306,13 +304,11 @@ if (isset($_GET['download'])) {
         .receipt-table th { 
             background: #f8f9fa; 
             font-weight: bold;
-            color: #333;
         }
         
         .total-row { 
             background: #fff3cd; 
             font-weight: bold; 
-            color: #856404; 
             border: 2px solid #ffc107;
         }
         
@@ -348,7 +344,6 @@ if (isset($_GET['download'])) {
         
         .btn-log:hover {
             background: #545b62;
-            box-shadow: 0 6px 20px rgba(108,117,125,0.4);
         }
         
         .download-section {
@@ -374,6 +369,13 @@ if (isset($_GET['download'])) {
             border-radius: 10px;
             border-left: 5px solid #0066cc;
         }
+
+        .empty-result {
+            padding: 20px;
+            text-align: center;
+            color: #666;
+            font-style: italic;
+        }
     </style>
 </head>
 <body>
@@ -383,16 +385,16 @@ if (isset($_GET['download'])) {
     
     <div class="upload-area">
         <form method="POST" enctype="multipart/form-data">
-            <h3 style="margin-bottom: 20px; color: #009944;">レシート画像をアップロード</h3>
+            <h3 style="margin-bottom: 20px; color: #009944;">📸 レシート画像をアップロード</h3>
             <input type="file" name="images[]" multiple accept="image/*" required>
             <br>
-            <button type="submit" class="btn">📄 レシートを読み取る</button>
+            <button type="submit" class="btn">🔍 レシートを読み取る</button>
         </form>
     </div>
 
     <?php if (!empty($results)): ?>
         <div class="summary">
-            <h3>📊 処理結果サマリー</h3>
+            <h3>📊 処理結果</h3>
             <p><strong>処理ファイル数:</strong> <?php echo count($results); ?> 件</p>
             <p><strong>処理時刻:</strong> <?php echo date('Y年m月d日 H:i:s'); ?></p>
         </div>
@@ -400,7 +402,7 @@ if (isset($_GET['download'])) {
         <?php foreach ($results as $fname => $items): ?>
             <div class="receipt-container">
                 <div class="receipt-header">
-                    📄 ファイル: <?php echo htmlspecialchars($fname); ?>
+                    📄 <?php echo htmlspecialchars($fname); ?>
                 </div>
                 
                 <?php if (!empty($items)): ?>
@@ -418,7 +420,7 @@ if (isset($_GET['download'])) {
                         </tbody>
                     </table>
                 <?php else: ?>
-                    <div style="padding: 20px; text-align: center; color: #666;">
+                    <div class="empty-result">
                         商品情報を抽出できませんでした。
                     </div>
                 <?php endif; ?>
@@ -426,9 +428,9 @@ if (isset($_GET['download'])) {
         <?php endforeach; ?>
 
         <div class="download-section">
-            <h3 style="margin-bottom: 20px; color: #333;">📥 ダウンロード</h3>
-            <a href="?download=csv" class="btn">📊 CSVファイルをダウンロード</a>
-            <a href="?download=log" class="btn btn-log">📋 ログファイルをダウンロード</a>
+            <h3 style="margin-bottom: 20px;">📥 ダウンロード</h3>
+            <a href="?download=csv" class="btn">📊 CSV</a>
+            <a href="?download=log" class="btn btn-log">📋 ログ</a>
         </div>
     <?php endif; ?>
 </div>
