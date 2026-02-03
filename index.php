@@ -65,9 +65,16 @@ function shouldSkipLine($text) {
         '/アプリ/u',
         '/東京都/u',
         '/新宿区/u',
-        '/貴No/u',
+        '/貴No/u',  // Số hóa đơn
+        '/^No\./u', // Số hóa đơn
+        '/^\d+-\d+$/u', // Mã số như 4-2180, 4-4617
         '/^¥\s*\d+\s*\)/u', // Dòng chỉ có thuế
         '/^\(\s*内\s*\)/u', // Dòng thuế trong ngoặc
+        '/^\d+%/u', // Phần trăm thuế như "8%"
+        '/PB\*\*\*/u', // Mã thẻ
+        '/^\s*証\s*$/u', // Chữ "証"
+        '/^\s*収\s*$/u', // Chữ "収"
+        '/^=+$/u', // Dòng kẻ =====
     ];
     
     foreach ($skipPatterns as $pattern) {
@@ -181,10 +188,16 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['images'])) {
                     $productName = cleanProductName(trim($matches[1]));
                     $price = str_replace(',', '', $matches[2]);
                     
+                    // Bỏ qua nếu là thông tin hóa đơn (貴No., レジ, etc.)
+                    if (preg_match('/(貴|No\.|レジ|証|収)/u', $productName)) {
+                        writeLog("❌ Bỏ qua thông tin hóa đơn: $productName");
+                        continue;
+                    }
+                    
                     // Kiểm tra không phải là dòng tổng tiền
                     if (!preg_match('/(合計|小計|計)/u', $productName)) {
-                        // Kiểm tra tên sản phẩm hợp lệ (không chỉ là số)
-                        if (!preg_match('/^\d+$/u', $productName) && !empty($productName)) {
+                        // Kiểm tra tên sản phẩm hợp lệ (không chỉ là số hoặc ký tự đơn)
+                        if (!preg_match('/^\d+$/u', $productName) && mb_strlen($productName, 'UTF-8') > 1) {
                             $extractedItems[] = [
                                 'name' => $productName, 
                                 'price' => $price, 
